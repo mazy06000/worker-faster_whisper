@@ -16,16 +16,16 @@ from runpod.serverless.utils import rp_cuda
 from faster_whisper import WhisperModel
 from faster_whisper.utils import format_timestamp
 
-# Define available models (for validation)
+# Import torch for CUDA memory management
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+# Only large-v2 model is available to avoid memory issues
 AVAILABLE_MODELS = {
-    "tiny",
-    "base",
-    "small",
-    "medium",
-    "large-v1",
     "large-v2",
-    "large-v3",
-    "turbo",
 }
 
 
@@ -34,14 +34,39 @@ class Predictor:
 
     def __init__(self):
         """Initializes the predictor with no models loaded."""
-        self.models = {}
+        self.model = None
         self.model_lock = (
             threading.Lock()
-        )  # Lock for thread-safe model loading/unloading
+        )  # Lock for thread-safe model access
 
     def setup(self):
-        """No models are pre-loaded. Setup is minimal."""
-        pass
+        """Pre-load large-v2 model to avoid loading delays and memory issues."""
+        print("Loading large-v2 model during setup...")
+        
+        # Clear CUDA cache before loading model to maximize available memory
+        if rp_cuda.is_available():
+            gc.collect()
+            if TORCH_AVAILABLE:
+                torch.cuda.empty_cache()
+                print("Cleared CUDA cache before model loading")
+        
+        try:
+            self.model = WhisperModel(
+                "large-v2",
+                device="cuda" if rp_cuda.is_available() else "cpu",
+                compute_type="float16" if rp_cuda.is_available() else "int8",
+                # Optimize memory usage
+                cpu_threads=4 if not rp_cuda.is_available() else 0,
+            )
+            print("large-v2 model loaded successfully and cached.")
+        except Exception as e:
+            print(f"Error loading large-v2 model during setup: {e}")
+            # Try to clear memory and provide helpful error message
+            if rp_cuda.is_available():
+                gc.collect()
+                if TORCH_AVAILABLE:
+                    torch.cuda.empty_cache()
+            raise RuntimeError(f"Failed to load large-v2 model during setup: {e}") from e
 
     def predict(
         self,
@@ -75,49 +100,12 @@ class Predictor:
                 f"Invalid model name: {model_name}. Available models are: {AVAILABLE_MODELS}"
             )
 
+        # Use the pre-loaded model (always large-v2)
         with self.model_lock:
-            model = None
-            if model_name not in self.models:
-                # Unload existing model if necessary
-                if self.models:
-                    existing_model_name = list(self.models.keys())[0]
-                    print(f"Unloading model: {existing_model_name}...")
-                    # Remove reference and clear dict
-                    del self.models[existing_model_name]
-                    self.models.clear()
-                    # Hint Python to release memory
-                    gc.collect()
-                    if rp_cuda.is_available():
-                        # If using PyTorch models, you might call torch.cuda.empty_cache()
-                        # FasterWhisper uses CTranslate2; explicit cache clearing might not be needed
-                        # but gc.collect() is generally helpful.
-                        pass
-                    print(f"Model {existing_model_name} unloaded.")
-
-                # Load the requested model
-                print(f"Loading model: {model_name}...")
-                try:
-                    loaded_model = WhisperModel(
-                        model_name,
-                        device="cuda" if rp_cuda.is_available() else "cpu",
-                        compute_type="float16" if rp_cuda.is_available() else "int8",
-                    )
-                    self.models[model_name] = loaded_model
-                    model = loaded_model
-                    print(f"Model {model_name} loaded successfully.")
-                except Exception as e:
-                    print(f"Error loading model {model_name}: {e}")
-                    raise ValueError(f"Failed to load model {model_name}: {e}") from e
-            else:
-                # Model already loaded
-                model = self.models[model_name]
-                print(f"Using already loaded model: {model_name}")
-
-            # Ensure model is loaded before proceeding
-            if model is None:
-                raise RuntimeError(
-                    f"Model {model_name} could not be loaded or retrieved."
-                )
+            if self.model is None:
+                raise RuntimeError("Model not loaded. Ensure setup() was called successfully.")
+            model = self.model
+            print(f"Using cached model: {model_name}")
 
         # Model is now loaded and ready, proceed with prediction (outside the lock?)
         # Consider if transcribe is thread-safe or if it should also be within the lock
